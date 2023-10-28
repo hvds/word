@@ -1,0 +1,12 @@
+#!/usr/bin/perl -nlw
+BEGIN { $| = 1; $l = 0 }
+$l2 = 1 + length;
+if ($l + $l2 > 79) {
+	print join " ", @a if @a;
+	@a = ($_);
+	$l = $l2;
+} else {
+	push @a, $_;
+	$l += $l2;
+}
+END { print join " ", @a if @a }

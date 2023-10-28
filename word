@@ -1,0 +1,931 @@
+#!/usr/bin/perl -wl
+use strict;
+use vars qw/$succeed $fail/;
+use re qw/eval/;
+our(@d, @e, @f, @g);
+
+my %lang = map +($_ => 1), qw{ nl };
+
+our($succeed, $fail) = (qr{}, qr{(?!)});
+my $out = sub { print };
+our($opt_n, $opt_x, $opt_N, $opt_X, $opt_p, $opt_P)
+	= (0, 99, '', "\xff", -t(STDIN), -t(STDOUT));
+our($opt_A, $opt_C, $opt_D, $opt_I, $opt_M, $opt_a, $opt_c, $opt_d, $opt_i,
+		$opt_l, $opt_L, $opt_q, $opt_r, $opt_R, $opt_u, $opt_U, $opt_v, $opt_V);
+our $arrayix = 0;		# for eval'd arrays
+my $dict = '/usr/share/dict/words';
+my $pre = '';
+my $t = 0;	# index of last-used backreference
+getopts();
+for (qw/ p P C c /) {
+	# global options
+	no strict 'refs';
+	&{"apply_$_"} if ${"opt_$_"};
+}
+@ARGV = map apply_A($_), @ARGV if $opt_A;
+@ARGV = map apply_r($_), @ARGV if $opt_r;
+@ARGV = map apply_R($_), @ARGV if $opt_R;
+@ARGV = map apply_M($_), @ARGV if $opt_M;
+for (qw/ ua Ua va V Ia ia la La a /) {
+	my($opt, $anag) = /(.)(a?)/;
+	no strict 'refs';
+	if (defined ${"opt_$opt"}) {
+		$opt = $_ if $anag && $opt_a;
+		@ARGV = map &{"apply_$opt"}($_), @ARGV;
+		last;
+	}
+}
+
+die "Nothing to do\n" unless @ARGV;
+my $re = "^$pre(?:" . (join "|", @ARGV) . ")\\z";
+warn "/$re/oi\n" if $opt_d || $opt_D;
+qr/$re/i, exit 0 if $opt_D;
+while (<STDIN>) {
+	chomp;
+	(my $s = $_) =~ s/\W//g;
+	my $l = length $s;
+	next if $l < $opt_n || lc $s lt $opt_N || $l > $opt_x || lc $s gt $opt_X;
+	$_ = $s if $opt_q;
+	&$out if $s =~ /$re/oi;
+}
+exit 0;
+
+sub apply_p {
+	open STDIN, $dict or die "$dict: $!";
+}
+
+sub apply_P {
+	open STDOUT, "| wrap" or die "|wrap: $!";
+	eval q{
+		END { close STDOUT or die "|wrap: $!" }
+	};
+	die if $@;
+}
+
+sub apply_C {
+	my @word;
+	$out = sub { push @{$word[length]}, $_ };
+	eval q{
+		END { print for map @$_, grep defined, @word }
+	};
+	die if $@;
+}
+
+sub apply_c {
+	my %list;
+	$out = sub { $list{substr($_, $opt_c - 1, 1)} = 1 };
+	eval q{
+		END { print join '', sort keys %list }
+	};
+	die if $@;
+}
+
+sub apply_r {
+	my $arg = shift;
+	my $bits = bits($arg);
+	($arg, rebuild([ reverse @$bits ]));
+}
+
+sub apply_R {
+	my $arg = shift;
+	my $bits = bits($arg);
+	my @list;
+	for my $i (0 .. $#$bits) {
+		my($frag, $min, $max) = @{ shift @$bits };
+		if ($max eq '') {
+			push @list, map rebuild([
+				[ $frag, $min - $_, '' ],
+				@$bits, [ $frag, $_, '' ]
+			]), 0 .. $min - 1;
+		} elsif ($max > 1) {
+			push @list, map rebuild([
+				[ $frag, ($min < $_) ? 0 : $min - $_, $max - $_ ],
+				@$bits, [ $frag, $_, $_ ]
+			]), 1 .. $max - 1;
+		}
+		push @$bits, [ $frag, $min, $max ];
+		push @list, rebuild($bits);
+	}
+	@list;
+}
+
+sub apply_u {
+	my $arg = shift;
+	rebuild([ map { $_->[1] = 0; $_ } @{ bits($arg) } ]);
+}
+
+sub apply_ua {
+	my @dots;
+	my @args = shift;
+	my @result;
+	ARG: while (@args) {
+		my $arg = shift @args;
+		my($dots, %seen);
+		my $c = ref($arg) ? $arg : comps($arg);
+
+		my $re = join '|', map {
+			my $class = $_;
+			my $count = $c->{$class}[1] || 0;	# only care about maximum
+			# if there is contention for some character in a character class,
+			# split the class and try again
+			if ($class =~ m{ ^ \[ (.*) \] $ }x) {
+				my %chars = map +($_ => 1), @{ charclass($1) };
+				for (keys %chars) {
+					if ($seen{$_}++ || $c->{$_}){
+						unshift @args, resplit($c, $class, $_);
+						next ARG;
+					}
+				}
+			}
+			($class eq '.') ? do {
+				$dots = $count;
+				die ".* must match everything with -ua\n" unless $dots;
+				();
+			} : $class . ($count ? sprintf('(?!%s)', ".*$class" x $count) : '')
+		} keys %$c;
+
+		if ($dots) {
+			push @dots, $dots;
+			push @result, sprintf '(?:%s|.(??{
+	local $d[%s] = $d[%s] - 1; $d[%s] >= 0 ? $succeed : $fail
+}))+', $re, $#dots, $#dots, $#dots;
+		} else {
+			push @result, "(?:$re)+";
+		}
+	}
+	$pre .= sprintf '(?{ @d = (%s) })', join ', ', @dots if @dots;
+	@result;
+}
+
+sub apply_A {
+	my $arg = shift;
+	$opt_a = 1;
+	my $l = length($arg);
+	map {
+		my $len = $_;
+		map substr($arg, $_, $len), 0 .. ($l - $len)
+	} ($opt_n || 1) .. ($opt_x || $l);
+}
+
+sub apply_U {
+	my $arg = shift;
+	rebuild([
+		map {
+			my($toke, $min, $max) = @$_;
+			$toke = "(?:^|$toke|\\z)";
+			my $off = $min ? $min - 1 : 0;
+			(
+				([ $toke, 1, 1 ]) x $off,
+				[ $toke, $min ? 1 : 0, defined($max) ? $max - $off : $max ],
+			)
+		} @{ bits($arg) }
+	]);
+}
+
+sub apply_Ua {
+	my $arg = shift;
+	my $l = length $arg;
+	my $min = $opt_n || 1;
+	map apply_a($_), map {
+		my $x = $_;
+		my $max = $l - $x;
+		$max = $opt_x if $opt_x < $max;
+		map substr($arg, $x, $_), $min .. $max;
+	} 0 .. $l - 1;
+}
+
+sub apply_v {
+	my $arg = shift;
+	my $b = bits($arg);
+	for (my $i = 0; $i < @$b; ++$i) {
+		my $bx = $b->[$i];
+		if ($bx->[0] eq '.') {
+			$bx->[2] = '';
+			next;
+		} elsif ($bx->[1] != 1 || !defined($bx->[2]) || $bx->[2] != 1) {
+			$bx->[0] = sprintf "(?:%s.*)", $bx->[0];
+		} elsif ($i == $#$b || $b->[$i+1][0] ne '.') {
+			splice @$b, ++$i, 0, [ '.', 0, '' ];
+		} # else the next component absorbs it
+	}
+	unshift @$b, [ '.', 0, '' ] unless $b->[0][0] eq '.';
+	rebuild($b);
+}
+
+sub apply_va {
+	my $arg = shift;
+	apply_a("$arg.*");
+}
+
+sub apply_V {
+	my $arg = shift;
+	my $b = bits($arg);
+	my @c;
+	for (my $i = 0; $i < @$b; ++$i) {
+		my @b2 = @$b;
+		my $bx = $b->[$i];
+		if ($bx->[0] eq '.') {
+			$b2[$i] = [ @$bx ];
+			$b2[$i]->[2] = '';
+		} elsif ($bx->[1] != 1 || !defined($bx->[2]) || $bx->[2] != 1) {
+			$b2[$i] = [ @$bx ];
+# FIXME: when $max > 1 we must split this group up
+			$b2[$i]->[0] = sprintf "(?:%s.*)", $bx->[0];
+		} elsif ($i == $#$b || $b->[$i+1][0] ne '.') {
+			splice @b2, $i + 1, 0, [ '.', 0, '' ];
+		} else {
+			next;	# the next component absorbs it
+		}
+		push @c, rebuild(\@b2);
+	}
+	unshift @$b, [ '.', 0, '' ] unless $b->[0][0] eq '.';
+	(rebuild($b), @c);
+}
+
+sub insert {
+	my($a, $n, $m) = @_;
+	my $dot = $m ? ".{$m}" : ".";
+	return $dot x ($n+1) unless length $a;
+	map {
+		my($a, $b) = /^([a-z]|\[.*?\]|\.+(?:[a-z]|\[.*?\]|$)|.)(.*)$/i;
+		(
+			($n ? map("$dot$_", insert($_, $n-1, $m)) : "$dot$_"),
+			map("$a$_", insert($b, $n, $m))
+		)
+	} $a;
+}
+
+sub apply_i {
+	my $arg = shift;
+	insert($arg, $opt_i - 1);
+}
+
+sub apply_I {
+	my $arg = shift;
+	# -I3
+	return insert($arg, 0, $opt_I) if $opt_I =~ /^\d+$/;
+	$opt_I = '.+' unless length $opt_I;
+	# -Istr
+	die "pattern too complex for '-I$opt_I'\n" unless $arg =~ m{
+		^ ( \. | [a-z] | \[ [a-z]+ \] )+ $
+	}xi;
+	my @bits = ($arg =~ /\. | [a-z] | \[ [a-z]+ \]/ixg);
+	map {
+		join '', @bits[0 .. $_ - 1], $opt_I, @bits[$_ .. $#bits]
+	} 0 .. @bits;
+}
+
+sub apply_ia {
+	my $arg = shift;
+	apply_a($arg . "." x $opt_i);
+}
+
+sub apply_Ia {
+	my $arg = shift;
+	die "-Ia not currently supported\n";
+	# this fails: the -a pattern is too complex for -I to handle
+	map apply_I($_), apply_a($arg);
+}
+
+sub new_apply_l {
+	# this would be the preferred approach if assertions with parens
+	# were backtracked; note backtracking is needed only if $latent eq '.'
+	my $arg = shift;
+	my $latent = ($opt_l =~ /[a-z]/i) ? $opt_l : '.';
+	my $pre = qq{(?= .* ($latent) )};
+	my @bits = $arg =~ /([a-z]|\[.*?\]|.)/ig;
+	++$t;
+	my($yes, $no) = (qq{\\$t*}, qq{(?!\\$t)});
+	join '', $pre, map({ $yes, $no, $_ } @bits), $yes;
+}
+
+sub apply_l {
+	# bug: we do not manage to remove all occurrences of the letter.
+	# eg C< -l t. > will match "tee"
+	my $arg = shift;
+	my $spec = ($opt_l =~ /^(?:([a-z])|\[([a-z]+)\])\z/i);
+	my $dot = $spec ? sprintf("[^%s]", $1 || $2) : '.';
+	my $latent = $spec ? $opt_l : '.';
+	my @bits = map { $_ eq '.' ? $dot : $_ } $arg =~ /([a-z]|\[.*?\]|.)/ig;
+	map {
+		if ($spec) {
+			join '', @bits[0..$_-1], "$latent+",
+					map "$_$latent*", @bits[$_..$#bits]
+		} else {
+			++$t;
+			join '', @bits[0..$_-1],
+					map "$_\\$t*(?!\\$t)", "($latent)", @bits[$_..$#bits]
+		}
+	} 0 .. @bits;
+}
+
+sub apply_L {
+	my $arg = shift;
+	my $spec = ($opt_L =~ /^(?:([a-z])|\[([a-z]+)\])\z/i);
+	if ($spec) {
+		my $dot = sprintf "[^%s]", $1 || $2;
+		my @bits = map { $_ eq '.' ? $dot : $_ } $arg =~ /([a-z]|\[.*?\]|.)/ig;
+		join "$opt_L*", '', @bits, '';
+	} else {
+		# when not specified, just include bare pattern as an option
+		local $opt_l = $opt_L;
+		($arg, apply_l($arg));
+	}
+}
+
+sub misprint_nodot {
+	my($a, $n) = @_;
+	return $a unless $n;
+	return () unless length $a;
+	map {
+		my($f, $m, $r) = /^(\.*)((?:[a-z]|\[.*?\])?)(.*)$/i;
+		die "Can't parse misprint string '$_'\n" unless length($f . $m);
+		my $m2 = ($m =~ /^[a-z]$/i) ? "[^$m]" : '.';
+		length($m) ? (
+			map("$f$m2$_", misprint_nodot($r, $n - 1)),
+			map("$f$m$_", misprint_nodot($r, $n)),
+		) : map("$f$_", misprint_nodot($r, $n))
+	} $a;
+}
+
+sub misprint {
+	my($a, $n) = @_;
+	return $a unless $n;
+	return () unless length $a;
+	my $dots = ($a =~ tr/.//);
+	my $m = $n - $dots;
+	$m = 0 if $m < 0;
+	map misprint_nodot($a, $_), $m .. $n;
+}
+
+sub apply_M {
+	my $arg = shift;
+	misprint($arg, $opt_M);
+}
+
+sub apply_Ma {
+	my $arg = shift;
+	map apply_a($_), misprint($arg, $opt_M);
+}
+
+sub apply_La {
+	my $arg = shift;
+	my $spec = ($opt_L =~ /^(?:([a-z])|\[([a-z]+)\])\z/i);
+	if ($spec) {
+		my $dot = sprintf "[^%s]", $1 || $2;
+		apply_a(
+			rebuild(map { $_ eq '.' ? $dot : $_ } bits($arg)) . "$opt_L*"
+		);
+	} else {
+		local $opt_l = $opt_L;
+		(apply_a($arg), apply_la($arg));
+	}
+}
+
+sub apply_la {
+	my $arg = shift;
+	my $fpre = '(?{
+  $d[%s] = [ %s ];
+  $e[%s] = [ (0) x %s ];
+  $f[%s] = {};
+  $g[%s] = {};
+})';
+	my $fmid = '(?:%s)*%s';
+	my $fpost = '(??{
+  (!keys(%%{ $g[%s] }) || grep $e[%s][$_] < $d[%s][$_][0], 0 .. %s)
+      ? $fail : $succeed
+})';
+	my $flim = '(%s)(??{ 
+  local $e[%s][%s] = $e[%s][%s] + 1;
+  local $f[%s]{$%s} = 1;
+  ($g[%s]{$%s} || $e[%s][%s] > $d[%s][%s][1]) ? $fail : $succeed
+})';
+	my $funlim = '(%s)(??{
+  local $e[%s][%s] = $e[%s][%s] + 1;
+  local $f[%s]{$%s} = 1;
+  $g[%s]{$%s} ? $fail : $succeed
+})';
+	my $latent = ($opt_l =~ /[a-z]/i) ? $opt_l : '.';
+	my $flatent = '(' . $latent . ')(??{
+  local $g[%s]{$%s} = 1;
+  (keys %%{ $g[%s] } > 1 || $f[%s]{$%s}) ? $fail : $succeed
+})';
+
+	my $c = comps($arg);
+	my @init = keys %$c;
+	my $re = sprintf $fmid, join('|', map({
+		my $pat = $init[$_];
+		++$t;
+		$c->{$pat}[1]
+			? sprintf $flim, $pat, ($arrayix, $_) x 2, ($arrayix, $t) x 2,
+					($arrayix, $_) x 2
+			: sprintf $funlim, $pat, ($arrayix, $_) x 2, ($arrayix, $t) x 2
+	} 0 .. $#init), do {
+		++$t;
+		sprintf $flatent, $arrayix, $t, $arrayix, $arrayix, $t
+	}), sprintf($fpost, ($arrayix) x 3, $#init);
+	$pre .= sprintf $fpre, $arrayix,
+			join(', ', map "[ $_->[0], $_->[1] ]", @$c{@init}),
+			$arrayix, $#init + 1, ($arrayix) x 2;
+	++$arrayix;
+	$re;
+}
+
+sub apply_a {
+	my $arg = shift;
+	my $fpre = '(?{
+  $d[%s] = [ %s ];
+  $e[%s] = [ (0) x %s ];
+})';
+	my $fmid = '(?:%s)*%s';
+	my $fpost = '(??{
+  (grep $e[%s][$_] < $d[%s][$_][0], 0 .. %s) ? $fail : $succeed
+})';
+	my $flim = '%s(??{ 
+  local $e[%s][%s] = $e[%s][%s] + 1;
+  $e[%s][%s] > $d[%s][%s][1] ? $fail : $succeed
+})';
+	my $funlim = '%s(?{
+  local $e[%s][%s] = $e[%s][%s] + 1;
+})';
+	
+	my $c = comps($arg);
+	$c->{".{$opt_I}"} = [1, 1] if $opt_I;
+	my %seen;
+	my $simple = 1;
+	SIMPLE: for (keys %$c) {
+		next if $_ eq '.';
+		# must have min=max for all non-dots
+		$simple = 0, last if !$c->{$_}[1] || $c->{$_}[0] != $c->{$_}[1];
+		if (/^[a-z]$/i) {
+			$simple = 0, last if $seen{lc $_}++;
+		} elsif (/^\[(\w+)]\]$/) {
+			for (split //, $1) {
+				$simple = 0, last SIMPLE if $seen{lc $_}++;
+			}
+		} else {
+			# something we don't know how to handle
+			$simple = 0, last SIMPLE;
+		}
+	}
+
+	if ($simple) {
+		# optimise when simple characters and classes without overlap
+
+# /^(?:(?:e(?!.*e)|s(?!.*s)|t(?!.*t.*t)){4})\z/ is about 10% faster than
+# /^(?:(?=.*e)(?=.*s)(?=.*t.*t).{4,4})\z/, which is about 10% faster than
+# /^(?:(?:([es])(?!.*\1)|([t])(?!.*\2.*\2)){4})\z/, but the middle way
+# allows support for dots and non-overlapping character classes.
+# 
+# Not sure whether this can simply be extended to cover 'test?', which
+# the other approaches _would_ be able to handle.
+
+		my($min, $max) = (0, 0);
+		my $dots = delete $c->{'.'};
+		my $re = join '', map {
+			my($cmin, $cmax) = @{ $c->{$_} };
+			$min += $cmin;
+			$max += $cmax;
+			sprintf "(?=%s)", ".*$_" x $cmin;
+		} keys %$c;
+		if ($dots) {
+			$min += $dots->[0];
+			$max = $dots->[1] ? $max + $dots->[1] : undef;
+		}
+		sprintf "%s.{%s,%s}", $re, $min, $max || '';
+	} else {
+		my @init = keys %$c;
+		my $re = sprintf $fmid, join('|', map {
+			my $pat = $init[$_];
+			$c->{$pat}[1] ? sprintf $flim, $pat, ($arrayix, $_) x 4
+					: sprintf $funlim, $pat, ($arrayix, $_) x 2
+		} 0 .. $#init), sprintf $fpost, $arrayix, $arrayix, $#init;
+		$pre .= sprintf $fpre, $arrayix,
+				join(', ', map "[ $_->[0], $_->[1] ]", @$c{@init}),
+				$arrayix, scalar @init;
+		++$arrayix;
+		$re;
+	}
+}
+
+# Split the content of a [...] charclass into a sorted list of letters.
+# Assumes "^abc-d", does not handle non-letters etc.
+sub charclass {
+	my($class) = @_;
+	my $negate = ($class =~ s{^\^}{}) ? 1 : 0;
+	my %seen;
+	while ($class =~ s{(\w)-(\w)}{}) {
+		$seen{lc $_} = 1 for $1 .. $2;
+	}
+	$seen{lc $_} = 1 for split //, $class;
+	return [ grep $negate ^ ($seen{$_} // 0), 'a' .. 'z' ];
+}
+
+#
+# handle [...], ?, +, *, {a, b}
+#
+sub bits {
+	my $re = shift;
+	my $toke;
+	[ map {
+		if (defined $toke) {
+			my($min, $max) = (1, 1);
+			if ($_ eq '') {
+			} elsif ($_ eq '?') {
+				$min = 0;
+			} elsif ($_ eq '+') {
+				$max = '';
+			} elsif ($_ eq '*') {
+				($min, $max) = (0, '');
+			} elsif ($_ =~ /^\{(\d*)(,)?(\d*)\}$/) {
+				$min = $1 || 0;
+				$max = ($2 ? $3 : $1) || '';
+			} else {
+				die "panic: unknown quantifier passed through";
+			}
+			[ ("$toke", $toke = undef)[0], $min, $max ];
+		} elsif (m{ ^ \[ (.*) \] \z }x) {
+			# canonicalize ranges and negation in charclass
+			$toke = sprintf '[%s]', join '', @{ charclass($1) };
+			();
+		} else {
+			$toke = $_;
+			();
+		}
+	} $re =~ /
+		\G
+		( \\. | [^[?*+{] | \[ (?: \\. | [^\]] )* \] )
+		( [+?*] | \{\d*,?\d*\} | )
+	/gx ];
+}
+
+sub rebuild {
+	my $bits = shift;
+	join '', map {
+		my($toke, $min, $max) = @$_;
+		my $quant = "{$min,$max}";
+		$quant = (
+			$max eq '' ?
+				($min == 0 ? '*' : $min == 1 ? '+' : $quant)
+			: $max eq 1 ?
+				($min == 0 ? '?' : $min == 1 ? '' : $quant)
+			: $quant
+		);
+		($toke, $quant)
+	} @$bits;
+}
+
+sub comps {
+	my $bits = bits(@_);
+	my %c;
+	for (@$bits) {
+		my($p, $n, $x) = @$_;
+		if ($c{$p}) {
+			$n += $c{$p}[0];
+			$x = length($x) && length($c{$p}[1]) ? $x + $c{$p}[1] : '';
+		}
+		$c{$p} = [ $n, $x ];
+	}
+	\%c;
+}
+
+sub resplit {
+	my($comp, $class, $char) = @_;
+	my $c1 = clone($comp);
+	my $c2;
+	my($min, $max) = @{ $c1->{$class} };
+	my @sclass = grep $_ ne $char, substr($class, 1, -1) =~ /(\\.|.)/g;
+	my $sclass = join '', @sclass;
+	$sclass = "[$sclass]" if @sclass > 1;
+	subtract($c1, $class, 1, 1);
+	$c2 = clone($c1);
+	add($c2, $char, 1, 1);
+	add($c1, $sclass, 1, 1);
+	($c1, $c2);
+}
+
+sub add {
+	my($comp, $class, $min, $max) = @_;
+	my $entry = $comp->{$class} ||= [ 0, 0 ];
+	$entry->[0] += $min;
+	$entry->[1] = length($max) && length($entry->[1]) ? $max + $entry->[1] : '';
+}
+
+sub subtract {
+	my($comp, $class, $min, $max) = @_;
+	my $entry = $comp->{$class} ||= [ 0, 0 ];
+	$entry->[0] = ($entry->[0] > $min) ? $entry->[0] - $min : 0;
+	$entry->[1] = (length($max) && $entry->[1] > $max) ? $entry->[1] - $max : 0
+			if length $entry->[1];
+	$entry->[0] = $entry->[1]
+			if length($entry->[1]) && $entry->[1] < $entry->[0];
+	delete $comp->{$class} if $entry->[1] eq '0';
+}
+
+sub clone {
+	my $comp = shift;
+	+{
+		map {
+			$_ => [ @{ $comp->{$_} } ]
+		} keys %$comp
+	}
+}
+
+sub getopts {
+	while (@ARGV && $ARGV[0] =~ /^-/) {
+		local $_ = shift @ARGV;
+		last if $_ eq '--';
+		$dict = $1, $opt_p = 1, next if /^-f(.+)/;
+        if (/^-w(.+)/) {
+            my $lang = $1;
+            die "unknown language <$1>" unless $lang{$lang};
+            $dict =~ s{(\w+-)?(?=words)}{$lang-};
+            next;
+        }
+		if (m{
+			^ -
+			(
+				[ACDLMPRUVadlpqruv]
+			|
+				# -i3
+				[Mceinx] \d+
+			|
+				# -I or -I3
+				[I] \d*
+			|
+				# -l=e | -l=[abc]
+				[Ll] = (?: \w | \[ \w+ \] )
+			)
+			(?! [=\d] )
+			# skip this for -Iinsert -Nmin -Xmax
+			(.+)
+		}x) {
+			unshift @ARGV, "-$2";
+			$_ = "-$1";
+		}
+		no strict 'refs';
+		${"opt_$1"} = 1 - (${"opt_$1"} || 0), next
+				if /^-([ACDLMPRUVadlpqruv])$/;
+		${"opt_$1"} = $2, next if /^-([IMcinx])(\d*)$/;
+		$opt_n = $opt_x = $1, next if /^-e(\d+)$/;
+		${"opt_$1"} = $2, next if /^-([lL])=(\w|\[\w+\])$/;
+		${"opt_$1"} = lc(length($2) ? $2 : shift(@ARGV)), next
+				if /^-([INX])(.*)/;
+		die "Unknown option '$_'\n";
+	}
+	no strict 'refs';
+	die "Inconsistent options" if ($opt_C && defined($opt_c)) || 1 < grep {
+		defined ${"opt_$_"}
+	} qw/ I L V i l u v /;
+}
+
+__END__
+
+=head1 USAGE
+
+word -c<n>i<n>n<n>x<n>rRuvUVlLdCpP -N<word> -X<word> pattern [ pattern ... ]
+
+=head1 DESCRIPTION
+
+Find and print words that match any of the given patterns. By default
+(without options), the patterns are perl regexps (automatically anchored
+at both ends), the words are matched after removing any non-alphabetic
+characters and the output is one word per line in the order seen.
+If input is coming from a pipe, the words to try matching against are
+read from the pipe (one word per line), else they are taken from
+/usr/dict/words; if output is not going to a pipe, it is piped instead
+into 'wrap', which is expected to be an executable program on the path.
+
+If any of the options C<ailuvM> are specified, the patterns still
+behave like perl regexps, but with some restrictions: character ranges
+and quantifiers are supported, but not capturing parens nor any of the
+C<(?...)> extensions.
+
+Whatever options are given, the results are achieved primarily by
+constructing a single regexp to match against words.
+
+=head1 OPTIONS
+
+=over 4
+
+=item -d
+
+Debug: show the constructed regular expression before matching.
+
+=item -D
+
+Debug: show the constructed regular expression, and terminate without
+matching.
+
+=item -c<n>
+
+Cut: show only the distinct characters appearing as the I<n>th letter
+of matching words, suitable for use as a character class:
+
+  word [`word -c1 ..u.s`].o.s.o.d
+
+=item -CE<lt>n>
+
+Column: output matching words grouped by length, shortest first:
+
+  word -Cua constantinople
+
+=item -q
+
+Quote: Do not pass through any non-alphabetic characters: words that
+match are printed with the non-alphabetic characters stripped out
+(ie in the same form as they were matched). This is often needed when
+piping output to another program that may misinterpret these characters.
+
+Thus if C<word dont> outputs "don't", C<word -q dont> would output "dont".
+
+=item -f<file>
+
+File: take words from I<file> instead of from /usr/dict/words or
+STDIN. C<-p> should not be supplied in addition.
+
+=item -p
+
+Pipe (in): reverse the input logic - take words from /usr/dict/words
+if input comes from a pipe, else take them from STDIN. This is
+particularly useful when patterns are being passed through from xargs:
+
+  word -qn8 .+ | perl -nle 'print scalar reverse' | xargs word -p
+
+=item -P
+
+Pipe (out): reverse the output logic - pipe output to 'wrap' if STDOUT
+is a tty, else don't.
+
+=item -e<n>
+
+Equal: match only against words exactly I<n> characters long.
+
+=item -nE<lt>n>
+
+miNimum: match only against words at least I<n> characters long.
+
+=item -xE<lt>n>
+
+maXimum: match only against words at most I<n> characters long.
+
+=item -NE<lt>word>
+
+miNimum: match only if word comes alphabetically after I<word>
+(case insignificantly).
+
+=item -XE<lt>word>
+
+maXimum: match only if word comes alphabetically before I<word>
+(case insignificantly).
+
+=item -a
+
+Anagram: match words for which any anagram matches the patterns supplied:
+
+  word -a arts
+
+=item -u
+
+subset: match against any subset of the patterns supplied; also supports
+the C<-a> option:
+
+  word -ue7 constantinople
+  word -uae7 constantinople
+
+=item -U
+
+constrained subset: match against any contiguous subset of the patterns
+supplied; also supports the C<-a> option (not yet supported with -a):
+
+  word -U satrap	# gives 'sat', 'trap' but not 'sap'
+  word -Ua satrap	# gives 'arts' but not 'spa'
+
+=item -v
+
+superset: match against any superset of the patterns supplied; also
+supports the C<-a> option:
+
+  word -v aeiou
+  word -vae4 xy
+
+=item -V
+
+constrained superset: match against a superset of the patterns supplied
+such that only one block of letters is inserted; equivalent to -I<n>
+with a wildcard for <n>.
+
+  word -V disal
+
+=item -i<n>
+
+Insert: match against any pattern with I<n> letters inserted; also supports
+the C<-a> option:
+
+  word -i2 crosord
+
+=item -IE<lt>n>
+
+Insert: match against any pattern with I<n> consecutive letters inserted;
+also supports the C<-a> option:
+
+  word -I3 croord
+
+=item -r
+
+Reverse: also match the same patterns in reverse
+
+  word -r drowssorc
+
+=item -R
+
+Rotate: also match a word if moving any number of characters from the start
+to the end would match a pattern.
+
+  word -R wordcross
+
+=item -M<n>
+
+Misprint: match against any pattern with exactly I<n> misprints; also
+supports the C<-a> option:
+
+  word -M2 dressword
+
+Note that '.' in the pattern is treated as 'unknown', so can represent
+a misprint even though it matches the corresponding letter:
+
+  word -M o.yx
+
+=item -l | -l=<c> | -l=[list]
+
+Letters Latent: select words that would match against any supplied
+pattern if all occurrences of one letter (or all of the given list
+of letters) were removed; also supports the -a option:
+
+  word -la mppssss
+
+If the latent character <c> is supplied, only that letter will be
+permitted:
+
+  word -l=ia mppssss
+
+If a class is given, all of the letters in the given class are
+removed:
+
+  word -l=[em] rbrd
+
+=item -L | -L=<c> | -L=[list]
+
+Letters latent: as for I<-l>, but matches words that includes no
+occurrences of the letter.
+
+=head1 BUGS/FUTURE
+
+Some options do not support all the intended pattern constructs. Some
+of the constructed regexps are truly horrible - not sure whether that's
+necessary in all cases.
+
+word -l and -la are too loose: they permit the latent letter to positively
+match components of the pattern.
+
+Need options corresponding to C<-i> and C<-I> for deletions, but note
+that C<word -i2 test> is equivalent to C<word -ve6 test>, and that
+C<word -delete2 test> is equivalent to C<word -ue2 test>. (However,
+C<word -e7 -delete1 .+test> is not identical to C<word -ue7 .+test>.)
+
+C<word -M{x}a letters> yields an expensive pattern; this could be sped
+up by filtering the superset C<word -uae{length} letters.{x}>,
+or replaced by C<word -uae{n} letters.{x} MINUS word -uae<n> letters.{x-1}>.
+
+Need a shell mode, which would allow the possibility of reading in the
+dictionary file once and doing preparatory work on it (eg for anagrams):
+% limit 100
+results limit set to 100
+% -e6
+13146 words match
+% | -r(0,0) z
+zesters zincite zinking zoolite zoolith zoology
+% |-
+esters incite inking oolite oolith oology
+%
+
+Multi-word anagrams would be nice, but are tricky to make useful.
+
+Need mechanisms to find 2 or more words related to each other in specific
+ways, eg: "find a 7 letter word that consists of a 5 letter word with
+'ie' inserted somewhere in it". I don't know how to express those
+relationships - perhaps shell mode will make this easier. Currently you
+can get a simplified form of these with a pipe:
+  word -qe7 .+ie.+ | perl -ple 's/ie//i' | xargs word -pe5
+.. but it's much more difficult to get right for source words that
+have 'ie' twice (like 'pieties'), and you lose the relationship between
+the words.
+
+In general, we can't handle captures and backreferences in input
+patterns; this is also true when we do multiple apply_?()s. (See eg
+apply_Ia().) I think we'd need to get a lot more formal to handle
+such things, since each pattern or fragment would need to retain
+knowledge of the base index for its parens. Hmm, or maybe keep
+everything based at 1 until combining.
+
+=cut
